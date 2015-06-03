@@ -77,6 +77,17 @@ func kill(process *os.Process) error {
 	return nil
 }
 
+type ColoredWriter struct {
+	io.Writer
+}
+
+func (cw ColoredWriter) Write(p []byte) (n int, err error) {
+	cw.Writer.Write([]byte("\033[91m"))
+	n, err = cw.Writer.Write(p)
+	cw.Writer.Write([]byte("\033[0m"))
+	return
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Println("goguard")
@@ -133,7 +144,7 @@ func main() {
 			cmd.Start()
 
 			go io.Copy(os.Stdout, stdout)
-			go io.Copy(os.Stderr, stderr)
+			go io.Copy(ColoredWriter{os.Stderr}, stderr)
 
 			// wait for message to restart
 			select {
