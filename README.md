@@ -1,12 +1,18 @@
 # goguard
 Just a simple reload-on-change guard for processes.
 
-partially based on (CodeReload)[https://github.com/githubnemo/CompileDaemon]
+partially based on [CodeReload](https://github.com/githubnemo/CompileDaemon)
+
+# Features
+
+* kills process and child processes
+* 
 
 # Usage
 
 ```
 go get github.com/dutchcoders/goguard
+
 $GOPATH/bin/goguard go run server/main.go -port 127.0.0.1:8081
 ```
 

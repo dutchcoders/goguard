@@ -22,13 +22,6 @@ const WorkDelay = 1500
 
 type globList []string
 
-func (g *globList) String() string {
-	return fmt.Sprint(*g)
-}
-func (g *globList) Set(value string) error {
-	*g = append(*g, value)
-	return nil
-}
 func (g *globList) Matches(value string) bool {
 	for _, v := range *g {
 		if match := glob.Glob(v, value); match {
@@ -68,7 +61,7 @@ func kill(process *os.Process) error {
 
 	select {
 	case <-time.After(10 * time.Second):
-		fmt.Println("Killing unresponding processes. We've asked them nicely once before.")
+		fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Killing unresponding processes. We've asked them nicely once before.")
 		err := syscall.Kill(-pgid, syscall.SIGKILL)
 		return err
 	case <-waiter:
@@ -77,12 +70,17 @@ func kill(process *os.Process) error {
 	return nil
 }
 
+func NewColoredWriter(w io.Writer, color int) ColoredWriter {
+	return ColoredWriter{Writer: w, color: color}
+}
+
 type ColoredWriter struct {
 	io.Writer
+	color int
 }
 
 func (cw ColoredWriter) Write(p []byte) (n int, err error) {
-	cw.Writer.Write([]byte("\033[91m"))
+	cw.Writer.Write([]byte(fmt.Sprintf("\033[%dm", cw.color)))
 	n, err = cw.Writer.Write(p)
 	cw.Writer.Write([]byte("\033[0m"))
 	return
@@ -108,7 +106,7 @@ func main() {
 	go restarter(events, restart)
 
 	defer func() {
-		fmt.Println("go-guard stopped.")
+		fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "go-guard stopped.")
 	}()
 
 	go func() {
@@ -124,7 +122,7 @@ func main() {
 				}
 			}()
 
-			fmt.Println("Starting: ", os.Args)
+			fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Starting: ", os.Args)
 
 			cmd := exec.Command(os.Args[1], os.Args[2:]...)
 
@@ -143,13 +141,26 @@ func main() {
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			cmd.Start()
 
-			go io.Copy(os.Stdout, stdout)
-			go io.Copy(ColoredWriter{os.Stderr}, stderr)
+			go io.Copy(NewColoredWriter(os.Stdout, 34), stdout)
+			go io.Copy(NewColoredWriter(os.Stderr, 91), stderr)
+
+			quit := make(chan error)
+
+			go func() {
+				err := cmd.Wait()
+				_ = err
+				// quit <- err
+			}()
 
 			// wait for message to restart
 			select {
+			case err := <-quit:
+				if err != nil {
+					fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Process crashed.", err)
+				}
+				// when unexpected quit, wait restart / stop again
 			case <-restart:
-				fmt.Println("Changes detected. Restarting.")
+				fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Changes detected. Restarting.")
 				kill(cmd.Process)
 			case <-stop:
 				kill(cmd.Process)
