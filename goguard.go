@@ -10,11 +10,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"syscall"
 	"time"
 
-	"github.com/howeyc/fsnotify"
+	"github.com/fatih/color"
+	"github.com/fsnotify/fsnotify"
 	"github.com/ryanuber/go-glob"
 )
 
@@ -61,7 +63,7 @@ func kill(process *os.Process) error {
 
 	select {
 	case <-time.After(10 * time.Second):
-		fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Killing unresponding processes. We've asked them nicely once before.")
+		fmt.Fprintln(os.Stderr, color.RedString("Killing unresponding processes. We've asked them nicely once before."))
 		err := syscall.Kill(-pgid, syscall.SIGKILL)
 		return err
 	case <-waiter:
@@ -106,7 +108,7 @@ func main() {
 	go restarter(events, restart)
 
 	defer func() {
-		fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "go-guard stopped.")
+		fmt.Fprintln(os.Stderr, color.YellowString("go-guard stopped"))
 	}()
 
 	go func() {
@@ -122,7 +124,7 @@ func main() {
 				}
 			}()
 
-			fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Starting: ", os.Args)
+			fmt.Fprintln(os.Stderr, color.YellowString("Starting: "), os.Args[1:])
 
 			cmd := exec.Command(os.Args[1], os.Args[2:]...)
 
@@ -139,28 +141,44 @@ func main() {
 			}
 
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-			cmd.Start()
+			if err := cmd.Start(); err != nil {
+				fmt.Println(err.Error())
+				continue
+			}
 
-			go io.Copy(NewColoredWriter(os.Stdout, 34), stdout)
+			go io.Copy(os.Stdout, stdout)
 			go io.Copy(NewColoredWriter(os.Stderr, 91), stderr)
 
-			quit := make(chan error)
+			// quit := make(chan error)
 
 			go func() {
 				err := cmd.Wait()
-				_ = err
-				// quit <- err
+
+				if err != nil {
+					fmt.Fprintln(os.Stderr, color.RedString(fmt.Sprintf("Starting: %s", err)))
+				} else {
+					// when unexpected quit, wait restart / stop again
+					fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Process finished clean.")))
+				}
 			}()
 
 			// wait for message to restart
 			select {
-			case err := <-quit:
-				if err != nil {
-					fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Process crashed.", err)
+			case s := <-terminating:
+				fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Got break. Restarting.")))
+				cmd.Process.Signal(s)
+
+				// wait for process to finish clean
+				select {
+				case <-time.After(time.Second * 2):
+
+					// force after two seconds
+				case <-terminating:
+					kill(cmd.Process)
+					return
 				}
-				// when unexpected quit, wait restart / stop again
 			case <-restart:
-				fmt.Fprintln(NewColoredWriter(os.Stderr, 93), "Changes detected. Restarting.")
+				fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Changes detected. Restarting.")))
 				kill(cmd.Process)
 			case <-stop:
 				kill(cmd.Process)
@@ -177,7 +195,7 @@ func main() {
 
 	defer watcher.Close()
 
-	flag_excludedFiles := globList([]string{".git", ".gopath"})
+	flag_excludedFiles := globList([]string{".git", ".gopath", "node_modules", "bower_components", "Godeps", "cache.db", "vendor"})
 	patterns := globList([]string{"**.go", "**.html"})
 
 	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
@@ -186,7 +204,8 @@ func main() {
 				return filepath.SkipDir
 			}
 
-			return watcher.Watch(path)
+			fmt.Println("Watching path", path)
+			return watcher.Add(path)
 		}
 		return err
 	})
@@ -197,26 +216,22 @@ func main() {
 
 	for {
 		select {
-		case ev := <-watcher.Event:
-			if ev.IsAttrib() {
-				continue
-			}
-
+		case ev := <-watcher.Events:
 			if ev.Name == "" {
 				continue
 			}
 
-			if patterns.Matches(ev.Name) {
+			name := path.Clean(ev.Name)
+			if flag_excludedFiles.Matches(name) {
 				continue
 			}
 
-			if flag_excludedFiles.Matches(ev.Name) {
+			if !patterns.Matches(name) {
 				continue
 			}
 
 			events <- ev.Name
-
-		case err := <-watcher.Error:
+		case err := <-watcher.Errors:
 			if v, ok := err.(*os.SyscallError); ok {
 				if v.Err == syscall.EINTR {
 					continue
@@ -224,9 +239,8 @@ func main() {
 				log.Fatal("watcher.Error: SyscallError:", v)
 			}
 			log.Fatal("watcher.Error:", err)
-		case <-terminating:
-			stop <- struct{}{}
-			<-stopped
+		case <-stopped:
+			watcher.Close()
 			return
 		}
 	}
