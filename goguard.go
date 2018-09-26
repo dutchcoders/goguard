@@ -226,6 +226,10 @@ func main() {
 				continue
 			}
 
+			if strings.HasPrefix(path.Base(name), ".") {
+				continue
+			}
+
 			if !patterns.Matches(name) {
 				continue
 			}
