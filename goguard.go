@@ -12,15 +12,18 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	glob "github.com/ryanuber/go-glob"
+
 	"github.com/fatih/color"
 	"github.com/fsnotify/fsnotify"
-	"github.com/ryanuber/go-glob"
 )
 
-const WorkDelay = 1500
+const WorkDelay = 3500
 
 type globList []string
 
@@ -31,19 +34,6 @@ func (g *globList) Matches(value string) bool {
 		}
 	}
 	return false
-}
-
-func restarter(events <-chan string, restart chan<- struct{}) {
-	var threshold <-chan time.Time
-
-	for {
-		select {
-		case <-events:
-			threshold = time.After(time.Duration(WorkDelay * time.Millisecond))
-		case <-threshold:
-			restart <- struct{}{}
-		}
-	}
 }
 
 func kill(process *os.Process) error {
@@ -97,7 +87,6 @@ func main() {
 	}
 
 	events := make(chan string)
-	restart := make(chan struct{})
 	stop := make(chan struct{})
 	stopped := make(chan struct{})
 	terminating := make(chan os.Signal, 1)
@@ -105,7 +94,7 @@ func main() {
 	signal.Notify(terminating, os.Interrupt)
 	signal.Notify(terminating, syscall.SIGTERM)
 
-	go restarter(events, restart)
+	// go restarter(events, restart)
 
 	defer func() {
 		fmt.Fprintln(os.Stderr, color.YellowString("go-guard stopped"))
@@ -116,6 +105,7 @@ func main() {
 			stopped <- struct{}{}
 		}()
 
+		var wg sync.WaitGroup
 		for {
 			var err error
 			defer func() {
@@ -124,7 +114,7 @@ func main() {
 				}
 			}()
 
-			fmt.Fprintln(os.Stderr, color.YellowString("Starting: "), os.Args[1:])
+			fmt.Fprintln(os.Stderr, color.YellowString("[goguard] starting: "), strings.Join(os.Args[1:], " "))
 
 			cmd := exec.Command(os.Args[1], os.Args[2:]...)
 
@@ -142,48 +132,112 @@ func main() {
 
 			cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 			if err := cmd.Start(); err != nil {
-				fmt.Println(err.Error())
+				fmt.Printf("Error occured during start: %s\n", err.Error())
 				continue
 			}
 
 			go io.Copy(os.Stdout, stdout)
 			go io.Copy(NewColoredWriter(os.Stderr, 91), stderr)
 
-			// quit := make(chan error)
+			stopped := make(chan error)
 
+			wg.Add(1)
 			go func() {
+				defer wg.Done()
+
 				err := cmd.Wait()
 
-				if err != nil {
-					fmt.Fprintln(os.Stderr, color.RedString(fmt.Sprintf("Starting: %s", err)))
-				} else {
-					// when unexpected quit, wait restart / stop again
-					fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Process finished clean.")))
+				select {
+				case stopped <- err:
+				default:
 				}
 			}()
 
 			// wait for message to restart
-			select {
-			case s := <-terminating:
-				fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Got break. Restarting.")))
-				cmd.Process.Signal(s)
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
 
-				// wait for process to finish clean
-				select {
-				case <-time.After(time.Second * 2):
+				var threshold <-chan time.Time
 
-					// force after two seconds
-				case <-terminating:
-					kill(cmd.Process)
-					return
+				for {
+					select {
+					case <-events:
+						threshold = time.After(time.Duration(WorkDelay * time.Millisecond))
+					case <-threshold:
+						fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("[goguard] Changes detected. Restarting.")))
+						kill(cmd.Process)
+						return
+					case s := <-terminating:
+						_ = s
+
+						pgid, err := syscall.Getpgid(cmd.Process.Pid)
+						if err != nil {
+							fmt.Println("Error pgid cmd")
+							return
+						}
+
+						syscall.Kill(-pgid, syscall.SIGTERM)
+
+						fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("[goguard] Terminating application. Restarting.")))
+
+						// wait for process to finish clean
+						select {
+						case <-time.After(time.Second * 2):
+							// force after two seconds
+							kill(cmd.Process)
+							return
+						case <-terminating:
+							fmt.Println("[goguard] yeah, yeah, quitting.")
+							// twice ctrl + c
+							os.Exit(0)
+						}
+					case <-stop:
+						kill(cmd.Process)
+						return
+					case err := <-stopped:
+						if err != nil {
+							fmt.Fprintln(os.Stderr, color.RedString(fmt.Sprintf("[goguard] Error: %s", err)))
+
+							for {
+								select {
+								case <-time.After(time.Second * 5):
+									return
+								case <-terminating:
+									select {
+									case <-time.After(time.Second * 2):
+										// force after two seconds
+										return
+									case <-terminating:
+										fmt.Println("[goguard] yeah, yeah, quitting.")
+										// twice ctrl + c
+										os.Exit(0)
+									}
+								case <-events:
+									threshold = time.After(time.Duration(WorkDelay * time.Millisecond))
+								case <-threshold:
+									kill(cmd.Process)
+									return
+								}
+							}
+						} else {
+							// when unexpected quit, wait restart / stop again
+							fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Process finished clean.")))
+
+							select {
+							case <-time.After(time.Second * 2):
+								return
+							case <-terminating:
+								fmt.Println("Yeah, yeah, quitting.")
+								// twice ctrl + c
+								os.Exit(0)
+							}
+						}
+					}
 				}
-			case <-restart:
-				fmt.Fprintln(os.Stderr, color.YellowString(fmt.Sprintf("Changes detected. Restarting.")))
-				kill(cmd.Process)
-			case <-stop:
-				kill(cmd.Process)
-				return
-			}
+			}()
+
+			wg.Wait()
 		}
 	}()
 
@@ -204,7 +258,6 @@ func main() {
 				return filepath.SkipDir
 			}
 
-			fmt.Println("Watching path", path)
 			return watcher.Add(path)
 		}
 		return err
@@ -234,7 +287,12 @@ func main() {
 				continue
 			}
 
-			events <- ev.Name
+			fmt.Println(ev.Name)
+
+			select {
+			case events <- ev.Name:
+			default:
+			}
 		case err := <-watcher.Errors:
 			if v, ok := err.(*os.SyscallError); ok {
 				if v.Err == syscall.EINTR {
