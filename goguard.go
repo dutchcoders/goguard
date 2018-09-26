@@ -195,7 +195,7 @@ func main() {
 
 	defer watcher.Close()
 
-	flag_excludedFiles := globList([]string{".git", ".gopath", "node_modules", "bower_components", "Godeps", "cache.db", "vendor"})
+	flag_excludedFiles := globList([]string{".git", ".gopath", "node_modules", "bower_components", "Godeps", "cache.db", "vendor", "cache"})
 	patterns := globList([]string{"**.go", "**.html"})
 
 	err = filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
